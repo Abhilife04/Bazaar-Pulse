@@ -44,13 +44,20 @@ async function fromYahoo(symbol) {
   if (!r) return null;
 
   const meta = r.meta || {};
-  const vols = (r.indicators?.quote?.[0]?.volume || []).filter((v) => v != null);
+  const quote = r.indicators?.quote?.[0] || {};
+  const vols = (quote.volume || []).filter((v) => v != null);
+  const closes = (quote.close || []).filter((v) => v != null);
   const todayVol = vols[vols.length - 1] ?? null;
   const past = vols.slice(0, -1).slice(-20);
   const avg20 = past.length ? past.reduce((a, b) => a + b, 0) / past.length : null;
 
-  const ltp = meta.regularMarketPrice;
-  const prev = meta.chartPreviousClose ?? meta.previousClose;
+  const ltp = meta.regularMarketPrice ?? closes[closes.length - 1];
+  // IMPORTANT: meta.chartPreviousClose = close before the requested RANGE
+  // (i.e. ~1 month ago for range=1mo). Yesterday's close is the second-to-last
+  // candle close, or the dedicated regularMarketPreviousClose field if present.
+  const prev =
+    meta.regularMarketPreviousClose ??
+    (closes.length > 1 ? closes[closes.length - 2] : meta.previousClose);
 
   return {
     symbol,
