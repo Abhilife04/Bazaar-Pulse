@@ -1,17 +1,13 @@
 import { useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, ReferenceLine,
-} from "recharts";
 import { compact } from "../lib/format";
 
 /* ------------------------------------------------------------------ */
-/* Column detection — supports two formats:                             */
-/*  A) SNAPSHOT:  Fund Name | Month | Asset Name | Sector | Shares Held */
-/*                | Market Value | AUM Weight % | Fund AUM               */
-/*     → month-over-month changes are COMPUTED by diffing snapshots.     */
-/*  B) CHANGE:    Fund Name | Stock Name | Position | Change in Position */
-/*     → changes are read directly.                                      */
+/* Per-fund view: each fund gets a sub-section with TWO tables —        */
+/*   ▲ Increased holdings (incl. NEW entries)                           */
+/*   ▼ Decreased holdings (incl. complete EXITs)                        */
+/* Supports snapshot format (Fund|Month|Asset|Sector|Shares…) and the   */
+/* legacy change-column format.                                         */
 /* ------------------------------------------------------------------ */
 
 const ALIASES = {
@@ -41,13 +37,11 @@ const num = (v) => {
   return Number.isNaN(n) ? 0 : n;
 };
 
-/** Normalize Excel serials / Dates / strings to a "YYYY-MM" key + label. */
 function monthKey(v) {
   let d = null;
   if (v instanceof Date) d = v;
-  else if (typeof v === "number" && v > 20000) {
-    d = new Date(Date.UTC(1899, 11, 30) + v * 86400000);
-  } else if (typeof v === "string") {
+  else if (typeof v === "number" && v > 20000) d = new Date(Date.UTC(1899, 11, 30) + v * 86400000);
+  else if (typeof v === "string") {
     const p = new Date(v);
     if (!Number.isNaN(p.getTime())) d = p;
   }
@@ -57,19 +51,75 @@ function monthKey(v) {
   return { key, label };
 }
 
+const short = (s) => s.replace(/\s+(Limited|Ltd\.?)$/i, "");
+
+/* Reusable table for one direction */
+function HoldingsTable({ items, isSnapshot, direction, fromLabel, toLabel }) {
+  const up = direction === "up";
+  return (
+    <div className="table-wrap" style={{ marginBottom: 18 }}>
+      <table>
+        <thead>
+          <tr>
+            <th>Stock</th>
+            <th>Sector / Industry</th>
+            <th>{up ? "Shares added" : "Shares reduced"}</th>
+            {isSnapshot && <th>{up ? "Est. buy" : "Est. sell"}</th>}
+            {isSnapshot && <th>Weight % ({fromLabel} → {toLabel})</th>}
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((e) => (
+            <tr key={e.stock}>
+              <td className="name">{short(e.stock)}</td>
+              <td className="neutral" style={{ fontFamily: "var(--font-display)", fontSize: 12, textAlign: "left" }}>
+                {e.sector}
+              </td>
+              <td className={up ? "up" : "down"}>
+                {up ? "+" : ""}{compact(e.change)}
+              </td>
+              {isSnapshot && (
+                <td className={up ? "up" : "down"}>
+                  {e.flowValue != null ? "₹" + compact(Math.abs(e.flowValue)) + " L" : "—"}
+                </td>
+              )}
+              {isSnapshot && (
+                <td className="neutral">
+                  {e.weightFrom != null ? e.weightFrom.toFixed(2) : "0.00"} → {e.weightTo != null ? e.weightTo.toFixed(2) : "0.00"}
+                </td>
+              )}
+              <td>
+                {e.isNew && <span className="pill pos" style={{ marginLeft: 0 }}>NEW ENTRY</span>}
+                {e.isExit && <span className="pill neg" style={{ marginLeft: 0 }}>FULL EXIT</span>}
+                {!e.isNew && !e.isExit && <span className="neutral">{up ? "added" : "trimmed"}</span>}
+              </td>
+            </tr>
+          ))}
+          {items.length === 0 && (
+            <tr>
+              <td colSpan={isSnapshot ? 6 : 4} className="neutral" style={{ textAlign: "left" }}>
+                {up ? "No holdings increased in this period" : "No holdings decreased in this period"}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function MFFlows() {
-  const [dataset, setDataset] = useState(null); // {mode, rows, months?, funds}
+  const [dataset, setDataset] = useState(null);
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [drag, setDrag] = useState(false);
-
   const [fromMonth, setFromMonth] = useState("");
   const [toMonth, setToMonth] = useState("");
-  const [fundFilter, setFundFilter] = useState("ALL");
-  const [selectedStock, setSelectedStock] = useState("");
+  const [show, setShow] = useState("both"); // both | up | down
 
   function parseFile(file) {
-    setError(""); setSelectedStock("");
+    setError("");
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
@@ -81,12 +131,10 @@ export default function MFFlows() {
         if (cols.fund == null || cols.stock == null) {
           throw new Error("Couldn't find Fund and Stock/Asset columns in the header row.");
         }
-
         const body = raw.slice(1).filter((r) => r[cols.fund] && r[cols.stock]);
         if (!body.length) throw new Error("No data rows found under the header row.");
 
         if (cols.month != null && cols.position != null) {
-          /* ---- SNAPSHOT MODE ---- */
           const rows = body.map((r) => {
             const m = monthKey(r[cols.month]);
             return {
@@ -102,26 +150,23 @@ export default function MFFlows() {
           });
           const months = [...new Map(rows.map((r) => [r.month, r.monthLabel])).entries()]
             .sort((a, b) => a[0].localeCompare(b[0]));
-          if (months.length < 2) throw new Error("Snapshot format detected but fewer than 2 months present — need at least 2 to compute flows.");
+          if (months.length < 2) throw new Error("Need at least 2 months of snapshots to compute changes.");
           const funds = [...new Set(rows.map((r) => r.fund))].sort();
           setDataset({ mode: "snapshot", rows, months, funds });
           setFromMonth(months[months.length - 2][0]);
           setToMonth(months[months.length - 1][0]);
-          setFundFilter("ALL");
         } else if (cols.change != null) {
-          /* ---- CHANGE-COLUMN MODE (legacy) ---- */
           const rows = body.map((r) => ({
             fund: String(r[cols.fund]).trim(),
             stock: String(r[cols.stock]).trim(),
-            sector: "",
+            sector: cols.sector != null ? String(r[cols.sector]).trim() : "",
             shares: cols.position != null ? num(r[cols.position]) : null,
             change: num(r[cols.change]),
           }));
           const funds = [...new Set(rows.map((r) => r.fund))].sort();
           setDataset({ mode: "change", rows, funds });
-          setFundFilter("ALL");
         } else {
-          throw new Error("Need either a Month + Shares Held combination (snapshots) or a Change in Position column.");
+          throw new Error("Need either Month + Shares Held columns (snapshots) or a Change in Position column.");
         }
         setFileName(file.name);
       } catch (err) {
@@ -132,23 +177,18 @@ export default function MFFlows() {
     reader.readAsArrayBuffer(file);
   }
 
-  /* ---------------- flow computation ---------------- */
-  const flows = useMemo(() => {
+  const fundSections = useMemo(() => {
     if (!dataset) return null;
 
-    // entry list: {fund, stock, sector, from, to, change, flowValue, weightFrom, weightTo, status}
     let entries = [];
-
     if (dataset.mode === "snapshot") {
-      const rel = dataset.rows.filter((r) => fundFilter === "ALL" || r.fund === fundFilter);
       const byFundStock = new Map();
-      for (const r of rel) {
+      for (const r of dataset.rows) {
         const k = r.fund + "||" + r.stock;
         const e = byFundStock.get(k) || { fund: r.fund, stock: r.stock, sector: r.sector, snaps: {} };
         if (!e.sector && r.sector) e.sector = r.sector;
-        // May 30 + May 31 → same key; keep the larger-shares snapshot (fuller disclosure)
         const prev = e.snaps[r.month];
-        if (!prev || r.shares > prev.shares) e.snaps[r.month] = r;
+        if (!prev || r.shares > prev.shares) e.snaps[r.month] = r; // merge dup dates in a month
         byFundStock.set(k, e);
       }
       for (const e of byFundStock.values()) {
@@ -158,85 +198,74 @@ export default function MFFlows() {
         const from = a?.shares ?? 0;
         const to = b?.shares ?? 0;
         const change = to - from;
-        // approximate price from market value / shares of whichever snapshot exists
+        if (change === 0) continue;
         const price =
           b && b.value && b.shares ? b.value / b.shares :
           a && a.value && a.shares ? a.value / a.shares : null;
         entries.push({
-          fund: e.fund, stock: e.stock, sector: e.sector,
+          fund: e.fund, stock: e.stock, sector: e.sector || "—",
           from, to, change,
-          flowValue: price != null ? change * price : null, // in Lakhs
+          flowValue: price != null ? change * price : null,
           weightFrom: a?.weight ?? null, weightTo: b?.weight ?? null,
-          status: !a && b ? "NEW" : a && !b ? "EXIT" : "HELD",
+          isNew: !a && !!b,
+          isExit: !!a && !b,
         });
       }
     } else {
       entries = dataset.rows
-        .filter((r) => fundFilter === "ALL" || r.fund === fundFilter)
+        .filter((r) => r.change !== 0)
         .map((r) => ({
-          fund: r.fund, stock: r.stock, sector: "",
-          from: null, to: r.shares, change: r.change, flowValue: null,
-          weightFrom: null, weightTo: null,
-          status: "HELD",
+          fund: r.fund, stock: r.stock, sector: r.sector || "—",
+          from: null, to: r.shares, change: r.change,
+          flowValue: null, weightFrom: null, weightTo: null,
+          isNew: false, isExit: false,
         }));
     }
 
-    /* aggregate per stock */
-    const byStock = new Map();
+    const byFund = new Map();
     for (const e of entries) {
-      const s = byStock.get(e.stock) || {
-        stock: e.stock, sector: e.sector, net: 0, flowValue: 0, hasFlowValue: false,
-        buyers: 0, sellers: 0, news: 0, exits: 0, funds: [],
+      const f = byFund.get(e.fund) || {
+        fund: e.fund, ups: [], downs: [],
+        buyValue: 0, sellValue: 0, hasValue: false,
+        newCount: 0, exitCount: 0,
+        buySectors: new Map(), sellSectors: new Map(),
       };
-      if (!s.sector && e.sector) s.sector = e.sector;
-      s.net += e.change;
-      if (e.flowValue != null) { s.flowValue += e.flowValue; s.hasFlowValue = true; }
-      if (e.change > 0) s.buyers++;
-      else if (e.change < 0) s.sellers++;
-      if (e.status === "NEW") s.news++;
-      if (e.status === "EXIT") s.exits++;
-      s.funds.push(e);
-      byStock.set(e.stock, s);
+      if (e.change > 0) {
+        f.ups.push(e);
+        if (e.flowValue != null) { f.buyValue += e.flowValue; f.hasValue = true; }
+        if (e.isNew) f.newCount++;
+        f.buySectors.set(e.sector, (f.buySectors.get(e.sector) || 0) + (e.flowValue ?? e.change));
+      } else {
+        f.downs.push(e);
+        if (e.flowValue != null) { f.sellValue += e.flowValue; f.hasValue = true; }
+        if (e.isExit) f.exitCount++;
+        f.sellSectors.set(e.sector, (f.sellSectors.get(e.sector) || 0) + Math.abs(e.flowValue ?? e.change));
+      }
+      byFund.set(e.fund, f);
     }
-    const stocks = [...byStock.values()].sort((a, b) =>
-      (b.hasFlowValue ? b.flowValue : b.net) - (a.hasFlowValue ? a.flowValue : a.net)
-    );
 
-    /* aggregate per sector */
-    const bySector = new Map();
-    for (const s of stocks) {
-      if (!s.sector) continue;
-      const g = bySector.get(s.sector) || { sector: s.sector, flowValue: 0, net: 0 };
-      g.flowValue += s.flowValue;
-      g.net += s.net;
-      bySector.set(s.sector, g);
-    }
-    const sectors = [...bySector.values()].sort((a, b) => b.flowValue - a.flowValue);
-
-    const newEntries = entries.filter((e) => e.status === "NEW");
-    const exits = entries.filter((e) => e.status === "EXIT");
-
-    return { entries, stocks, sectors, newEntries, exits };
-  }, [dataset, fromMonth, toMonth, fundFilter]);
+    return [...byFund.values()]
+      .sort((a, b) => a.fund.localeCompare(b.fund))
+      .map((f) => ({
+        ...f,
+        ups: f.ups.sort((x, y) => (y.flowValue ?? y.change) - (x.flowValue ?? x.change)),
+        downs: f.downs.sort((x, y) => (x.flowValue ?? x.change) - (y.flowValue ?? y.change)),
+        topBuySectors: [...f.buySectors.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([s]) => s),
+        topSellSectors: [...f.sellSectors.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([s]) => s),
+      }));
+  }, [dataset, fromMonth, toMonth]);
 
   const monthLabel = (key) => dataset?.months?.find((m) => m[0] === key)?.[1] || key;
-
-  const chartData = useMemo(() => {
-    if (!flows) return [];
-    const metric = (s) => (s.hasFlowValue ? s.flowValue : s.net);
-    const sorted = [...flows.stocks].sort((a, b) => metric(b) - metric(a));
-    const top = sorted.slice(0, 8);
-    const bottom = sorted.slice(-8).filter((s) => !top.includes(s)).reverse();
-    return [...top, ...bottom].map((s) => ({ name: s.stock.replace(/ Limited$/i, ""), v: +metric(s).toFixed(1) }));
-  }, [flows]);
-
-  const detail = useMemo(() => {
-    if (!flows || !selectedStock) return null;
-    return flows.stocks.find((s) => s.stock === selectedStock) || null;
-  }, [flows, selectedStock]);
-
   const isSnapshot = dataset?.mode === "snapshot";
-  const valueUnit = "₹ Lakhs (est.)";
+  const totals = useMemo(() => {
+    if (!fundSections) return null;
+    return {
+      ups: fundSections.reduce((a, f) => a + f.ups.length, 0),
+      downs: fundSections.reduce((a, f) => a + f.downs.length, 0),
+      news: fundSections.reduce((a, f) => a + f.newCount, 0),
+      exits: fundSections.reduce((a, f) => a + f.exitCount, 0),
+    };
+  }, [fundSections]);
 
   return (
     <div>
@@ -269,10 +298,10 @@ export default function MFFlows() {
         </>
       )}
 
-      {dataset && flows && (
+      {dataset && fundSections && totals && (
         <>
           <div className="controls">
-            <span className="badge">{fileName} · {dataset.funds.length} funds · {flows.stocks.length} stocks</span>
+            <span className="badge">{fileName}</span>
             {isSnapshot && (
               <>
                 <select value={fromMonth} onChange={(e) => setFromMonth(e.target.value)} aria-label="From month">
@@ -284,178 +313,87 @@ export default function MFFlows() {
                 </select>
               </>
             )}
-            <select value={fundFilter} onChange={(e) => setFundFilter(e.target.value)} aria-label="Fund filter">
-              <option value="ALL">All funds</option>
-              {dataset.funds.map((f) => <option key={f} value={f}>{f}</option>)}
+            <select value={show} onChange={(e) => setShow(e.target.value)} aria-label="Direction filter">
+              <option value="both">Increases & decreases</option>
+              <option value="up">Increases only</option>
+              <option value="down">Decreases only</option>
             </select>
-            <button className="btn ghost" onClick={() => { setDataset(null); setSelectedStock(""); }}>
-              Upload a different file
-            </button>
+            <button className="btn ghost" onClick={() => setDataset(null)}>Upload a different file</button>
           </div>
 
           <div className="grid cols-4">
             <div className="card">
-              <h3>Top accumulation</h3>
-              <div className="big up">{flows.stocks[0]?.stock.replace(/ Limited$/i, "") || "—"}</div>
-              <div className="hint">
-                {flows.stocks[0]?.hasFlowValue
-                  ? `≈ ₹${compact(flows.stocks[0].flowValue)} L net buying`
-                  : `+${compact(flows.stocks[0]?.net || 0)} shares net`}
-              </div>
+              <h3>Holdings increased</h3>
+              <div className="big up">{totals.ups}</div>
+              <div className="hint">{isSnapshot ? `${monthLabel(fromMonth)} → ${monthLabel(toMonth)}` : "across all funds"}</div>
             </div>
             <div className="card">
-              <h3>Top distribution</h3>
-              <div className="big down">{flows.stocks[flows.stocks.length - 1]?.stock.replace(/ Limited$/i, "") || "—"}</div>
-              <div className="hint">
-                {flows.stocks[flows.stocks.length - 1]?.hasFlowValue
-                  ? `≈ ₹${compact(flows.stocks[flows.stocks.length - 1].flowValue)} L net selling`
-                  : `${compact(flows.stocks[flows.stocks.length - 1]?.net || 0)} shares net`}
-              </div>
+              <h3>Holdings decreased</h3>
+              <div className="big down">{totals.downs}</div>
+              <div className="hint">Positions trimmed or sold</div>
             </div>
             <div className="card">
               <h3>Fresh entries</h3>
-              <div className="big" style={{ color: "var(--saffron)" }}>{flows.newEntries.length}</div>
-              <div className="hint">{isSnapshot ? `New fund-stock positions in ${monthLabel(toMonth)}` : "Not available in this format"}</div>
+              <div className="big" style={{ color: "var(--saffron)" }}>{isSnapshot ? totals.news : "—"}</div>
+              <div className="hint">Brand-new positions</div>
             </div>
             <div className="card">
               <h3>Complete exits</h3>
-              <div className="big" style={{ color: "var(--saffron)" }}>{flows.exits.length}</div>
-              <div className="hint">{isSnapshot ? `Positions fully sold since ${monthLabel(fromMonth)}` : "Not available in this format"}</div>
+              <div className="big" style={{ color: "var(--saffron)" }}>{isSnapshot ? totals.exits : "—"}</div>
+              <div className="hint">Positions fully sold</div>
             </div>
           </div>
 
-          <div className="section-title">
-            Net flows by stock
-            <small>{isSnapshot ? `${monthLabel(fromMonth)} → ${monthLabel(toMonth)} · Δshares × price, ${valueUnit}` : "net share change"}</small>
-          </div>
-          <div className="card" style={{ height: 320 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData} margin={{ top: 8, right: 8, left: 8, bottom: 55 }}>
-                <XAxis dataKey="name" angle={-38} textAnchor="end" tick={{ fill: "#8b94a7", fontSize: 10.5 }} interval={0} />
-                <YAxis tick={{ fill: "#8b94a7", fontSize: 11 }} tickFormatter={compact} />
-                <Tooltip
-                  formatter={(v) => [compact(v), isSnapshot ? valueUnit : "Net shares"]}
-                  contentStyle={{ background: "#141b2b", border: "1px solid #232e47", borderRadius: 8 }}
-                  labelStyle={{ color: "#e8ecf4" }}
-                />
-                <ReferenceLine y={0} stroke="#232e47" />
-                <Bar dataKey="v" radius={[4, 4, 0, 0]}>
-                  {chartData.map((d, i) => <Cell key={i} fill={d.v >= 0 ? "#2ecc8f" : "#ff5c5c"} />)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+          {fundSections.map((f) => (
+            <div key={f.fund}>
+              <div className="section-title" style={{ marginTop: 34 }}>
+                {f.fund}
+                <small>
+                  ▲ {f.ups.length} increased{f.newCount ? ` (${f.newCount} new)` : ""}
+                  {" · "}▼ {f.downs.length} decreased{f.exitCount ? ` (${f.exitCount} exits)` : ""}
+                  {f.hasValue ? ` · buy ≈ ₹${compact(f.buyValue)} L · sell ≈ ₹${compact(Math.abs(f.sellValue))} L` : ""}
+                </small>
+              </div>
 
-          {isSnapshot && flows.sectors.length > 0 && (
-            <>
-              <div className="section-title">Sector rotation <small>net estimated flow, {valueUnit}</small></div>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr><th>Sector</th><th>Net flow</th><th>Net shares</th></tr>
-                  </thead>
-                  <tbody>
-                    {flows.sectors.map((s) => (
-                      <tr key={s.sector}>
-                        <td className="name">{s.sector}</td>
-                        <td className={s.flowValue >= 0 ? "up" : "down"}>
-                          {s.flowValue >= 0 ? "+" : ""}₹{compact(s.flowValue)} L
-                        </td>
-                        <td className={s.net >= 0 ? "up" : "down"}>{s.net >= 0 ? "+" : ""}{compact(s.net)}</td>
-                      </tr>
+              {(show === "both" || show === "up") && (
+                <>
+                  <div style={{ margin: "8px 0 8px", fontSize: 13, fontWeight: 500, color: "var(--up)" }}>
+                    ▲ Increased
+                    {f.topBuySectors.length > 0 && f.topBuySectors.map((s) => (
+                      <span key={s} className="pill pos">{s}</span>
                     ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
+                  </div>
+                  <HoldingsTable
+                    items={f.ups} isSnapshot={isSnapshot} direction="up"
+                    fromLabel={monthLabel(fromMonth)} toLabel={monthLabel(toMonth)}
+                  />
+                </>
+              )}
 
-          <div className="section-title">Stock-wise flows <small>click a row for fund-level detail</small></div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Stock</th>
-                  {isSnapshot && <th>Sector</th>}
-                  <th>Net Δ shares</th>
-                  {isSnapshot && <th>Est. flow</th>}
-                  <th>Adding</th>
-                  <th>Cutting</th>
-                  <th>New / Exit</th>
-                </tr>
-              </thead>
-              <tbody>
-                {flows.stocks.map((s) => (
-                  <tr key={s.stock} onClick={() => setSelectedStock(s.stock)} style={{ cursor: "pointer" }}>
-                    <td className="name">{s.stock.replace(/ Limited$/i, "")}</td>
-                    {isSnapshot && <td className="neutral" style={{ fontFamily: "var(--font-display)", fontSize: 12 }}>{s.sector || "—"}</td>}
-                    <td className={s.net >= 0 ? "up" : "down"}>{s.net >= 0 ? "+" : ""}{compact(s.net)}</td>
-                    {isSnapshot && (
-                      <td className={s.flowValue >= 0 ? "up" : "down"}>
-                        {s.hasFlowValue ? (s.flowValue >= 0 ? "+" : "") + "₹" + compact(s.flowValue) + " L" : "—"}
-                      </td>
-                    )}
-                    <td className="up">{s.buyers}</td>
-                    <td className="down">{s.sellers}</td>
-                    <td className="neutral">
-                      {s.news ? <span className="pill pos">{s.news} new</span> : null}
-                      {s.exits ? <span className="pill neg">{s.exits} exit</span> : null}
-                      {!s.news && !s.exits ? "—" : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {detail && (
-            <>
-              <div className="section-title">Fund positions — {detail.stock}</div>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Fund</th>
-                      {isSnapshot && <th>{monthLabel(fromMonth)} shares</th>}
-                      <th>{isSnapshot ? monthLabel(toMonth) + " shares" : "Position"}</th>
-                      <th>Change</th>
-                      {isSnapshot && <th>Weight %</th>}
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {detail.funds
-                      .slice()
-                      .sort((a, b) => b.change - a.change)
-                      .map((f, i) => (
-                        <tr key={i}>
-                          <td className="name">{f.fund}</td>
-                          {isSnapshot && <td>{compact(f.from)}</td>}
-                          <td>{compact(f.to)}</td>
-                          <td className={f.change >= 0 ? "up" : "down"}>{f.change >= 0 ? "+" : ""}{compact(f.change)}</td>
-                          {isSnapshot && (
-                            <td className="neutral">
-                              {f.weightFrom != null ? f.weightFrom.toFixed(2) : "—"} → {f.weightTo != null ? f.weightTo.toFixed(2) : "—"}
-                            </td>
-                          )}
-                          <td>
-                            {f.status === "NEW" && <span className="pill pos">NEW</span>}
-                            {f.status === "EXIT" && <span className="pill neg">EXIT</span>}
-                            {f.status === "HELD" && <span className="neutral">held</span>}
-                          </td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          )}
+              {(show === "both" || show === "down") && (
+                <>
+                  <div style={{ margin: "8px 0 8px", fontSize: 13, fontWeight: 500, color: "var(--down)" }}>
+                    ▼ Decreased
+                    {f.topSellSectors.length > 0 && f.topSellSectors.map((s) => (
+                      <span key={s} className="pill neg">{s}</span>
+                    ))}
+                  </div>
+                  <HoldingsTable
+                    items={f.downs} isSnapshot={isSnapshot} direction="down"
+                    fromLabel={monthLabel(fromMonth)} toLabel={monthLabel(toMonth)}
+                  />
+                </>
+              )}
+            </div>
+          ))}
 
           {isSnapshot && (
             <div className="note">
-              "Est. flow" ≈ change in shares × latest available price (market value ÷ shares), in ₹ Lakhs.
-              It approximates buying/selling value and ignores intramonth price moves. Months with two
-              disclosure dates (e.g. 30th and 31st) are merged, keeping the fuller snapshot.
+              Each fund shows two lists: holdings <span className="up">increased</span> (with NEW ENTRY badges)
+              and holdings <span className="down">decreased</span> (with FULL EXIT badges). Pills next to the
+              headings are that fund's most-bought / most-sold sectors. "Est. buy/sell" ≈ Δshares × month-end
+              price in ₹ Lakhs. Note: corporate renames or mergers appear as an exit in one name and a new
+              entry in another. Months with two disclosure dates are merged automatically.
             </div>
           )}
         </>
